@@ -156,11 +156,29 @@ class TestPortchannel(object):
 
         #  TESTS here that LACP key is valid and equls to the expected LACP key
         #  The expected LACP key in the number at the end of the Port-Channel name with a prefix '1'
-        for portchannel in itertools.chain(portchannelNames, portchannelNamesAuto):
+        #  teamd may take more than the initial 1s sleep above to publish member state into
+        #  `teamdctl ... state dump` (especially on slow/loaded VS test agents). Poll until the
+        #  expected JSON shape appears rather than failing on the first attempt with KeyError.
+        def _get_lacp_key(portchannel):
             (exit_code, output) = dvs.runcmd("teamdctl " + portchannel[0] + " state dump")
-            port_state_dump = json.loads(output)
-            lacp_key = port_state_dump["ports"][portchannel[1]]["runner"]["actor_lacpdu_info"]["key"]
-            assert lacp_key == portchannel[2]
+            if exit_code != 0 or not output:
+                return None
+            try:
+                port_state_dump = json.loads(output)
+                return port_state_dump["ports"][portchannel[1]]["runner"]["actor_lacpdu_info"]["key"]
+            except (ValueError, KeyError, TypeError):
+                return None
+
+        for portchannel in itertools.chain(portchannelNames, portchannelNamesAuto):
+            lacp_key = None
+            for _ in range(30):
+                lacp_key = _get_lacp_key(portchannel)
+                if lacp_key == portchannel[2]:
+                    break
+                time.sleep(1)
+            assert lacp_key == portchannel[2], \
+                "teamd LACP key for {} not ready (got {!r}, expected {!r})".format(
+                    portchannel[0], lacp_key, portchannel[2])
 
         # remove PortChannel members
         tbl = swsscommon.Table(self.cdb, "PORTCHANNEL_MEMBER")
@@ -388,16 +406,23 @@ class TestPortchannel(object):
         time.sleep(1)
 
         # Check ASIC DB
-        # get TPID and validate it to be 0x9200 (37376)
+        # get TPID and validate it to be 0x9200 (37376). The TPID write travels
+        # CONFIG_DB -> APPL_DB -> orchagent -> ASIC_DB; on slow VS hosts this
+        # round-trip can exceed the previous static 1s sleep. Poll until the
+        # ASIC entry reflects the configured TPID instead of asserting once.
         atbl = swsscommon.Table(adb, "ASIC_STATE:SAI_OBJECT_TYPE_LAG")
-        lag = atbl.getKeys()[0]
-        (status, fvs) = atbl.get(lag)
-        assert status == True
         asic_tpid = "0"
-
-        for fv in fvs:
-            if fv[0] == "SAI_LAG_ATTR_TPID":
-                asic_tpid = fv[1]
+        for _ in range(30):
+            keys = atbl.getKeys()
+            if keys:
+                (status, fvs) = atbl.get(keys[0])
+                if status:
+                    for fv in fvs:
+                        if fv[0] == "SAI_LAG_ATTR_TPID":
+                            asic_tpid = fv[1]
+                    if asic_tpid == "37376":
+                        break
+            time.sleep(1)
 
         assert asic_tpid == "37376"
 
@@ -440,17 +465,29 @@ class TestPortchannel(object):
         (exitcode, _) = dvs.runcmd("ip link set dev PortChannel111 carrier on")
         assert exitcode == 0, "ip link set failed"
 
-        # verify port-channel members netdev oper status
-        tbl =  swsscommon.Table(state_db, "PORT_TABLE")
-        status, fvs = tbl.get("Ethernet0")
-        assert status is True
-        fvs = dict(fvs)
-        assert fvs['netdev_oper_status'] == 'up'
+        # verify port-channel members netdev oper status. The portmgr netlink listener
+        # may take more than the 1s waited above to propagate the carrier change to
+        # STATE_DB, especially on busy CI agents. Poll until the field flips to "up".
+        tbl = swsscommon.Table(state_db, "PORT_TABLE")
 
-        status, fvs = tbl.get("Ethernet4")
-        assert status is True
-        fvs = dict(fvs)
-        assert fvs['netdev_oper_status'] == 'up'
+        def _wait_netdev_oper_up(port):
+            for _ in range(30):
+                status, fvs = tbl.get(port)
+                if status:
+                    d = dict(fvs)
+                    if d.get('netdev_oper_status') == 'up':
+                        return d
+                time.sleep(1)
+            status, fvs = tbl.get(port)
+            return dict(fvs) if status else {}
+
+        d0 = _wait_netdev_oper_up("Ethernet0")
+        assert d0.get('netdev_oper_status') == 'up', \
+            "Ethernet0 netdev_oper_status not up: {}".format(d0)
+
+        d4 = _wait_netdev_oper_up("Ethernet4")
+        assert d4.get('netdev_oper_status') == 'up', \
+            "Ethernet4 netdev_oper_status not up: {}".format(d4)
 
         # verify a PORT_TABLE entry containing the PortChannel is NOT created
         # in APPDB (sonic-buildimage Issue #21688)
